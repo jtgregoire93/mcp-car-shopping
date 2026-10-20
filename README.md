@@ -1,37 +1,37 @@
 # @jtgregoire93/mcp-car-shopping
 
-MCP server connector for the major used car marketplaces: [CarMax](https://www.carmax.com), [Carvana](https://www.carvana.com) and [CarGurus](https://www.cargurus.com). Automates their flows via Playwright + Browserbase.
+MCP server connector for [CarMax](https://www.carmax.com) and [Carvana](https://www.carvana.com). Automates their flows with Playwright, driving your local Google Chrome or a Browserbase remote browser.
+
+For CarGurus, use CarGurus' official connector instead (claude.ai → Settings → Connectors → CarGurus). See [CarGurus' setup guide](https://cargurus.helpscoutdocs.com/article/599-connect-ai-assistants-to-cargurus-with-the-mcp-connector).
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `search_all` | Search CarMax, Carvana and CarGurus at once with the same filters |
+| `search_all` | Search CarMax and Carvana at once with the same filters |
 | `carmax_search_inventory` | Search CarMax inventory by make, model, year, price, and ZIP code |
-| `carmax_get_vehicle_details` | Get full details (specs, features, photos, Carfax) for a CarMax vehicle |
+| `carmax_get_vehicle_details` | Get full details (price, VIN, specs, history highlights, store, photos) for a CarMax vehicle |
 | `carmax_schedule_test_drive` | Schedule a test drive appointment at CarMax |
 | `carmax_get_instant_offer` | Get an instant offer for selling your car by VIN or license plate |
 | `carvana_search_inventory` | Search Carvana inventory by make, model, year, price, and ZIP code |
-| `carvana_get_vehicle_details` | Get full details (specs, features, photos) for a Carvana vehicle |
+| `carvana_get_vehicle_details` | Get full details (price, total with tax/title, VIN, specs) for a Carvana vehicle |
 | `carvana_get_offer` | Get a Carvana sell/trade-in offer by VIN or license plate |
-| `cargurus_search_listings` | Search CarGurus dealer listings, including deal ratings |
-| `cargurus_get_listing_details` | Get full details for a CarGurus listing (deal rating, price analysis, days on market, dealer) |
-| `cargurus_contact_dealer` | Send a message to the dealer for a CarGurus listing |
 
 ## Requirements
 
 - Node.js ≥ 18
-- [Browserbase](https://browserbase.com) account with a CDP URL
+- Google Chrome installed, **or** a [Browserbase](https://browserbase.com) account
 
 ## Setup
 
+By default the server drives your installed Google Chrome. It opens a real Chrome window parked off-screen, because both sites block headless Chrome. It keeps its own profile at `~/.cache/mcp-car-shopping/chrome-profile` so the sites' bot-check cookies carry over between runs.
+
 ### Environment Variables
 
-```bash
-export BROWSERBASE_CDP_URL="wss://connect.browserbase.com?apiKey=YOUR_KEY"
-```
-
-CarMax and Carvana block plain datacenter browsers, so use a Browserbase session with stealth mode / proxies enabled.
+| Variable | Effect |
+|----------|--------|
+| `BROWSERBASE_CDP_URL` | Use a Browserbase remote browser instead of local Chrome, e.g. `wss://connect.browserbase.com?apiKey=YOUR_KEY`. Enable stealth mode / proxies; both sites block plain datacenter browsers. |
+| `HEADLESS=1` | Run local Chrome headless. Usually gets blocked by CarMax and Carvana. |
 
 ## Usage with Claude Desktop
 
@@ -42,20 +42,25 @@ Add to your `claude_desktop_config.json`:
   "mcpServers": {
     "car-shopping": {
       "command": "npx",
-      "args": ["-y", "@jtgregoire93/mcp-car-shopping"],
-      "env": {
-        "BROWSERBASE_CDP_URL": "wss://connect.browserbase.com?apiKey=YOUR_KEY"
-      }
+      "args": ["-y", "@jtgregoire93/mcp-car-shopping"]
     }
   }
 }
+```
+
+Add `"env": { "BROWSERBASE_CDP_URL": "..." }` to use Browserbase instead of local Chrome.
+
+Claude Code:
+
+```bash
+claude mcp add car-shopping -- npx -y @jtgregoire93/mcp-car-shopping
 ```
 
 ## Tool Details
 
 ### `search_all`
 
-Runs the CarMax, Carvana and CarGurus searches in parallel. A site that fails is reported without failing the others.
+Runs the CarMax and Carvana searches in parallel. A site that fails is reported without failing the other.
 
 ```
 search_all({ zip: "90210", make: "Toyota", model: "Camry", year_min: 2019, price_max: 30000, limit: 5 })
@@ -63,12 +68,11 @@ search_all({ zip: "90210", make: "Toyota", model: "Camry", year_min: 2019, price
 
 ### Search (per site)
 
-All three take the same filters: `zip`, `make`, `model`, `year_min`, `year_max`, `price_min`, `price_max`, `limit`. CarGurus requires `zip` and `make`.
+Both take the same filters: `zip`, `make`, `model`, `year_min`, `year_max`, `mileage_max`, `price_min`, `price_max`, `limit`. Make and model are applied by the site; the year, price and mileage filters are applied to the first page of results (about 48 cars on CarMax), so a narrow filter can return fewer than `limit`. CarMax sorts by distance from `zip`. Carvana ships nationwide and ignores `zip`.
 
 ```
 carmax_search_inventory({ zip: "90210", make: "Toyota", model: "Camry", year_min: 2019, year_max: 2023, price_max: 30000, limit: 10 })
 carvana_search_inventory({ make: "Honda", model: "Civic", price_max: 25000 })
-cargurus_search_listings({ zip: "60601", make: "Ford", model: "F-150", year_min: 2020 })
 ```
 
 ### Vehicle details
@@ -78,10 +82,9 @@ Use the ID from the search results:
 ```
 carmax_get_vehicle_details({ stock_number: "25123456" })
 carvana_get_vehicle_details({ vehicle_id: "3012345" })
-cargurus_get_listing_details({ listing_id: "391234567" })
 ```
 
-Returns title, price, mileage, VIN, specs, features and photo URLs, plus site-specific info: store location and Carfax for CarMax; deal rating, price analysis, days on market and dealer for CarGurus.
+Returns title, price, mileage, VIN and specs, plus site-specific info: store location, vehicle history highlights and photo URLs for CarMax; total price with estimated tax, title and registration for Carvana.
 
 ### `carmax_schedule_test_drive`
 
@@ -110,22 +113,7 @@ carmax_get_instant_offer({ vin: "1HGCM82633A123456", mileage: 85000, zip: "90210
 carvana_get_offer({ license_plate: "ABC1234", state: "CA", mileage: 85000 })
 ```
 
-If the site asks condition questions or an email before showing the offer, the tool returns the link to continue.
-
-### `cargurus_contact_dealer`
-
-Sends a real inquiry with your contact info, so it only runs with `confirm: true`.
-
-```
-cargurus_contact_dealer({
-  listing_id: "391234567",
-  first_name: "Jane",
-  last_name: "Smith",
-  email: "jane@example.com",
-  message: "Is this still available? Can I see it Saturday?",
-  confirm: true
-})
-```
+Both sites identify the car from the VIN or plate, then ask style and condition questions (and an email) before showing an offer. The tool enters the VIN/plate and ZIP, waits for the lookup, and returns what the site found plus the questions it stopped at, with a link to finish on the site.
 
 ## Development
 
@@ -137,7 +125,7 @@ npm run build   # bundles src/index.ts to dist/index.js
 
 ## How It Works
 
-This connector uses [Playwright](https://playwright.dev) over a [Browserbase](https://browserbase.com) remote browser session (via CDP) to automate each site's website. No unofficial APIs — all data comes directly from CarMax.com, Carvana.com and CarGurus.com.
+This connector uses [Playwright](https://playwright.dev) with your local Chrome or a [Browserbase](https://browserbase.com) remote browser session (via CDP) to automate each site. CarMax search reads the full car records CarMax embeds in its search page; everything else reads the rendered pages. No unofficial APIs — all data comes directly from CarMax.com and Carvana.com.
 
 ## License
 

@@ -1,7 +1,7 @@
 {
   "name": "@jtgregoire93/mcp-car-shopping",
   "version": "0.1.0",
-  "description": "MCP server connector for CarMax, Carvana and CarGurus: search used cars across all three, get vehicle details, get sell offers, schedule test drives and contact dealers",
+  "description": "MCP server connector for CarMax and Carvana: search used cars on both, get vehicle details and sell/trade-in offers, schedule CarMax test drives",
   "main": "dist/index.js",
   "bin": {
     "mcp-car-shopping": "dist/index.js"
@@ -17,7 +17,6 @@
     "mcp",
     "carmax",
     "carvana",
-    "cargurus",
     "cars",
     "automotive",
     "used-cars",

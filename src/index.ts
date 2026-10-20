@@ -5,31 +5,37 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { chromium, type Browser, type Page } from "playwright-core";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { chromium, type BrowserContext, type Page } from "playwright-core";
 
 // ─── Browser ─────────────────────────────────────────────────────────────────
 
-let _browser: Browser | null = null;
+let _context: Promise<BrowserContext> | null = null;
 
-async function getBrowser(): Promise<Browser> {
-  if (_browser?.isConnected()) return _browser;
+// Browserbase when BROWSERBASE_CDP_URL is set, otherwise the locally installed Google Chrome
+async function launchContext(): Promise<BrowserContext> {
   const cdpUrl = process.env.BROWSERBASE_CDP_URL;
-  if (!cdpUrl) {
-    throw new Error("BROWSERBASE_CDP_URL environment variable is required");
+  if (cdpUrl) {
+    const browser = await chromium.connectOverCDP(cdpUrl);
+    return browser.contexts()[0] ?? browser.newContext();
   }
-  _browser = await chromium.connectOverCDP(cdpUrl);
-  return _browser;
+  // A persistent profile keeps the sites' bot-check clearance cookies between runs
+  return chromium.launchPersistentContext(join(homedir(), ".cache", "mcp-car-shopping", "chrome-profile"), {
+    channel: "chrome",
+    // Headless Chrome trips the sites' bot protection, so run a real window parked off-screen
+    headless: process.env.HEADLESS === "1",
+    args: ["--window-position=-2400,-2400"],
+    viewport: { width: 1280, height: 900 },
+  });
 }
 
 async function newPage(): Promise<Page> {
-  const browser = await getBrowser();
-  const ctx =
-    browser.contexts()[0] ??
-    (await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }));
-  return ctx.newPage();
+  if (!_context) {
+    _context = launchContext();
+    _context.then((ctx) => ctx.on("close", () => (_context = null))).catch(() => (_context = null));
+  }
+  return (await _context).newPage();
 }
 
 // ─── Server ──────────────────────────────────────────────────────────────────
@@ -45,6 +51,7 @@ const searchProps = {
   model: { type: "string", description: "Vehicle model (e.g., 'Camry', 'F-150', 'Civic')" },
   year_min: { type: "number", description: "Minimum model year (e.g., 2018)" },
   year_max: { type: "number", description: "Maximum model year (e.g., 2023)" },
+  mileage_max: { type: "number", description: "Maximum mileage" },
   price_min: { type: "number", description: "Minimum price in dollars" },
   price_max: { type: "number", description: "Maximum price in dollars" },
   limit: { type: "number", description: "Number of results to return (default: 10, max: 25)" },
@@ -68,7 +75,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "search_all",
       description:
-        "Search CarMax, Carvana and CarGurus at once with the same filters. Returns each site's results side by side, sorted by price. A site that fails is reported without failing the others.",
+        "Search CarMax and Carvana at once with the same filters. Returns each site's results side by side, sorted by price. A site that fails is reported without failing the other.",
       inputSchema: {
         type: "object",
         properties: {
@@ -88,7 +95,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "carmax_get_vehicle_details",
       description:
-        "Get full details for a specific CarMax vehicle by stock number, including specs, features, photos, Carfax history, and store location.",
+        "Get full details for a specific CarMax vehicle by stock number, including specs, photos, vehicle history highlights, and store location.",
       inputSchema: {
         type: "object",
         properties: {
@@ -153,50 +160,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "Get a cash offer from Carvana for selling or trading in your car. Provide VIN or license plate + state. Returns the offer if Carvana shows one, otherwise next steps.",
       inputSchema: { type: "object", properties: sellProps("the offer"), required: [] },
     },
-    // CarGurus
-    {
-      name: "cargurus_search_listings",
-      description:
-        "Search CarGurus used car listings from dealers near a ZIP code. Filter by make, model, year range and price range. Returns listing IDs, prices, mileage, CarGurus deal ratings, dealers, and links.",
-      inputSchema: {
-        type: "object",
-        properties: searchProps,
-        required: ["zip", "make"],
-      },
-    },
-    {
-      name: "cargurus_get_listing_details",
-      description:
-        "Get full details for a CarGurus listing by listing ID, including deal rating, price analysis, days on market, dealer, VIN, specs, and photos.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          listing_id: {
-            type: "string",
-            description: "CarGurus listing ID (e.g., '391234567'). Obtain from cargurus_search_listings results.",
-          },
-        },
-        required: ["listing_id"],
-      },
-    },
-    {
-      name: "cargurus_contact_dealer",
-      description:
-        "Send a message to the dealer for a CarGurus listing (e.g., to check availability). This sends a real inquiry with your contact info. Requires confirm:true to actually send; otherwise returns a preview only.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          listing_id: { type: "string", description: "CarGurus listing ID" },
-          confirm: confirmProp("send the message to the dealer"),
-          ...contactProps,
-          message: {
-            type: "string",
-            description: "Message to the dealer (default: asks whether the vehicle is still available)",
-          },
-        },
-        required: ["listing_id", "first_name", "last_name", "email"],
-      },
-    },
   ],
 }));
 
@@ -247,21 +210,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "carvana_get_offer":
         return await handleCarvanaOffer(a);
 
-      case "cargurus_search_listings":
-        return formatSearch("CarGurus", await cargurusSearch(a));
-      case "cargurus_get_listing_details":
-        return await handleCargurusDetails(a.listing_id as string);
-      case "cargurus_contact_dealer":
-        if (a.confirm !== true) {
-          return ok(
-            `PREVIEW ONLY. This WOULD send a message to the dealer for CarGurus listing ${a.listing_id}.\n` +
-              contactPreview(a) +
-              `  Message: ${a.message ?? DEFAULT_DEALER_MESSAGE}\n` +
-              `Nothing has been sent. Re-run with confirm:true to actually send.`
-          );
-        }
-        return await handleCargurusContact(a);
-
       default:
         return err(`Unknown tool: ${name}`);
     }
@@ -280,7 +228,6 @@ interface Vehicle {
   id: string;
   location: string;
   url: string;
-  dealRating?: string;
 }
 
 interface SearchResult {
@@ -288,8 +235,6 @@ interface SearchResult {
   vehicles: Vehicle[];
   totalText?: string;
 }
-
-const DEFAULT_DEALER_MESSAGE = "Hi, is this vehicle still available? I'd like to learn more.";
 
 function searchLimit(a: Record<string, unknown>, fallback = 10) {
   return Math.min(Number(a.limit ?? fallback), 25);
@@ -308,36 +253,14 @@ function matchesFilters(v: Vehicle, a: Record<string, unknown>) {
   if (year && a.year_max && year > Number(a.year_max)) return false;
   if (price && a.price_min && price < Number(a.price_min)) return false;
   if (price && a.price_max && price > Number(a.price_max)) return false;
+  const miles = mileageValue(v.mileage);
+  if (miles !== undefined && a.mileage_max && miles > Number(a.mileage_max)) return false;
   return true;
 }
 
-// Card text is split into lines; pick out the title, price, mileage and location
-function parseCardText(text: string) {
-  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-  const title = lines.find((l) => /\b(19|20)\d{2}\b/.test(l) && /[a-z]/i.test(l) && !/\$/.test(l)) ?? "";
-  const price = lines.find((l) => /^\$\s?[\d,]+$/.test(l)) ?? text.match(/\$\s?[\d,]{4,}/)?.[0] ?? "";
-  const mileage = text.match(/[\d,.]+k?\s*(mi\b|miles)/i)?.[0] ?? "";
-  const dealRating = text.match(/\b(Great|Good|Fair|High|Overpriced)\s+(Deal|Price)\b/i)?.[0];
-  return { title, price, mileage, dealRating };
-}
-
-async function scrapeCards(page: Page, cardSelector: string, linkSelector: string, maxResults: number) {
-  return page.evaluate(
-    ({ cardSelector, linkSelector, maxResults }) => {
-      let cards = Array.from(document.querySelectorAll(cardSelector));
-      // Fall back to the closest container of each vehicle link
-      if (cards.length === 0) {
-        cards = Array.from(document.querySelectorAll(linkSelector))
-          .map((a) => a.closest("article, li, [class*='card'], [class*='tile'], [class*='Tile']") ?? a)
-          .filter((el, i, arr) => arr.indexOf(el) === i);
-      }
-      return cards.slice(0, maxResults * 3).map((card) => {
-        const link = (card.matches(linkSelector) ? card : card.querySelector(linkSelector)) as HTMLAnchorElement | null;
-        return { text: (card as HTMLElement).innerText ?? "", href: link?.href ?? "" };
-      });
-    },
-    { cardSelector, linkSelector, maxResults }
-  );
+function mileageValue(text: string) {
+  const m = text.replace(/,/g, "").match(/([\d.]+)\s*(k)?\s*mi/i);
+  return m ? Math.round(Number(m[1]) * (m[2] ? 1000 : 1)) : undefined;
 }
 
 function formatSearch(site: string, r: SearchResult) {
@@ -355,7 +278,6 @@ function formatVehicle(v: Vehicle) {
   return [
     `**${v.title || "Unknown Vehicle"}**`,
     `  Price: ${v.price || "N/A"} | Miles: ${v.mileage || "N/A"}`,
-    v.dealRating ? `  Deal Rating: ${v.dealRating}` : "",
     v.id ? `  ID: ${v.id}` : "",
     v.location ? `  Location: ${v.location}` : "",
     v.url ? `  ${v.url}` : "",
@@ -384,9 +306,13 @@ async function withPage<T>(fn: (page: Page) => Promise<T>): Promise<T> {
 
 async function goto(page: Page, url: string) {
   const res = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-  const title = await page.title().catch(() => "");
-  if ((res && res.status() === 403) || /access denied|just a moment|attention required/i.test(title)) {
-    throw new Error(`${new URL(url).hostname} blocked the request (bot protection). Use a Browserbase session with stealth/proxies enabled.`);
+  const challenged = async () =>
+    /access denied|just a moment|attention required/i.test(await page.title().catch(() => "")) ||
+    /performing security verification/i.test(await page.evaluate(() => document.body?.innerText ?? "").catch(() => ""));
+  // Cloudflare's interstitial usually clears itself within a few seconds
+  for (let i = 0; i < 15 && (await challenged()); i++) await page.waitForTimeout(1000);
+  if ((await challenged()) || (res && res.status() === 403 && /access denied/i.test(await page.title().catch(() => "")))) {
+    throw new Error(`${new URL(url).hostname} blocked the request (bot protection). Run without HEADLESS=1, or use a Browserbase session with stealth/proxies enabled.`);
   }
 }
 
@@ -422,9 +348,10 @@ async function scrapeDetails(page: Page, titleSel: string, priceSel: string, mil
           .filter(Boolean);
 
       const body = document.body.innerText;
-      const title = getText(titleSel) || getText("h1");
-      const price = getText(priceSel) || (body.match(/\$\s?[\d,]{4,}/)?.[0] ?? "");
-      const mileage = getText(mileageSel) || (body.match(/[\d,]+k?\s*(mi\b|miles)/i)?.[0] ?? "");
+      const titleEl = document.querySelector(titleSel) ?? document.querySelector("h1");
+      const title = ((titleEl as HTMLElement | null)?.innerText ?? "").split("\n").map((l) => l.trim()).filter((l) => l && !/\bmiles?\b/i.test(l)).join(" ");
+      const price = (getText(priceSel).match(/\$\s?[\d,]{4,}/) ?? body.match(/\$\s?[\d,]{4,}/))?.[0] ?? "";
+      const mileage = ((document.querySelector(mileageSel) as HTMLElement | null)?.innerText.match(/[\d,]+k?\s*(mi\b|miles)/i) ?? body.match(/[\d,]+k?\s*(mi\b|miles)/i))?.[0] ?? "";
       const vinText = body.match(/VIN[:\s#]+([A-HJ-NPR-Z0-9]{17})/i)?.[1] ?? "";
 
       const features = getAll(
@@ -444,6 +371,12 @@ async function scrapeDetails(page: Page, titleSel: string, priceSel: string, mil
           const val = cells[1].textContent?.trim() ?? "";
           if (key && val) specs[key] = val;
         }
+      });
+      // Spec tiles that render as a value line followed by its label line (CarMax)
+      const lines = body.split("\n").map((l) => l.trim()).filter(Boolean);
+      const specLabels = ["Exterior Color", "Interior Color", "Drive Type", "Engine", "Transmission", "Horsepower", "Cargo Capacity", "Fuel Type"];
+      lines.forEach((line, i) => {
+        if (specLabels.includes(line) && i > 0 && !specs[line] && !specLabels.includes(lines[i - 1])) specs[line] = lines[i - 1];
       });
 
       return { title, price, mileage, vinText, features, photoUrls, specs, body };
@@ -484,11 +417,10 @@ async function handleSearchAll(a: Record<string, unknown>) {
   const sites: [string, (a: Record<string, unknown>) => Promise<SearchResult>][] = [
     ["CarMax", carmaxSearch],
     ["Carvana", carvanaSearch],
-    ["CarGurus", cargurusSearch],
   ];
   const settled = await Promise.allSettled(sites.map(([, search]) => search(args)));
 
-  const lines = ["**Used Car Search — CarMax, Carvana, CarGurus**\n"];
+  const lines = ["**Used Car Search — CarMax, Carvana**\n"];
   settled.forEach((res, i) => {
     const site = sites[i][0];
     if (res.status === "rejected") {
@@ -507,63 +439,51 @@ async function handleSearchAll(a: Record<string, unknown>) {
 
 // ─── CarMax ──────────────────────────────────────────────────────────────────
 
+interface CarmaxCar {
+  stockNumber: number;
+  year: number;
+  make: string;
+  model: string;
+  trim: string | null;
+  basePrice: number | null;
+  mileage: number | null;
+  storeName: string | null;
+  stateAbbreviation: string | null;
+  distance: number | null;
+}
+
 async function carmaxSearch(a: Record<string, unknown>): Promise<SearchResult> {
   return withPage(async (page) => {
+    const limit = searchLimit(a);
+    // /cars?makes=… is ignored by CarMax; make/model only filter as path segments
+    const path = a.make ? `/cars/${slug(a.make)}${a.model ? `/${slug(a.model)}` : ""}` : "/cars";
     const params = new URLSearchParams();
     if (a.zip) params.set("zip", String(a.zip));
-    if (a.make) params.set("makes", String(a.make).toLowerCase());
-    if (a.model) params.set("models", String(a.model).toLowerCase());
-    if (a.year_min) params.set("year-min", String(a.year_min));
-    if (a.year_max) params.set("year-max", String(a.year_max));
-    if (a.price_min) params.set("price-min", String(a.price_min));
-    if (a.price_max) params.set("price-max", String(a.price_max));
-    const limit = searchLimit(a);
-
-    const searchUrl = `https://www.carmax.com/cars?${params.toString()}`;
+    const searchUrl = `https://www.carmax.com${path}${params.toString() ? `?${params}` : ""}`;
     await goto(page, searchUrl);
-    await page
-      .waitForSelector('[data-qa="vehicle-card"], .car-card, [class*="vehicle-card"]', { timeout: 15000 })
-      .catch(() => null);
 
-    const vehicles = await page.evaluate((maxResults) => {
-      const results: Vehicle[] = [];
-      const cards = Array.from(
-        document.querySelectorAll('[data-qa="vehicle-card"], .vehicle-card, [class*="VehicleCard"], [class*="vehicle-card"]')
-      ).slice(0, maxResults);
+    // CarMax embeds every result's full record in an inline `const cars = [...]` script
+    const cars = (await page.evaluate(() => {
+      const script = Array.from(document.scripts).find((s) => s.textContent?.includes("const cars = "));
+      const m = script?.textContent?.match(/const cars = (\[.*?\]);\s*\n/s);
+      return m ? JSON.parse(m[1]) : [];
+    })) as CarmaxCar[];
 
-      for (const card of cards) {
-        const titleEl =
-          card.querySelector('[data-qa="vehicle-title"], [class*="title"], h2, h3') ||
-          card.querySelector("a[href*='/car/']");
-        const priceEl = card.querySelector('[data-qa="price"], [class*="price"], [class*="Price"]');
-        const mileageEl = card.querySelector('[data-qa="mileage"], [class*="mileage"], [class*="Mileage"]');
-        const locationEl = card.querySelector('[data-qa="store"], [class*="store"], [class*="location"]');
-        const linkEl = card.querySelector("a[href*='/car/']") as HTMLAnchorElement | null;
-        const href = linkEl?.href ?? "";
-        const stockNumber = href.match(/\/car\/(\d+)/)?.[1] ?? "";
+    const vehicles = cars
+      .map((c) => ({
+        title: [c.year, c.make, c.model, c.trim].filter(Boolean).join(" "),
+        price: c.basePrice != null ? `$${c.basePrice.toLocaleString()}` : "N/A",
+        mileage: c.mileage != null ? `${c.mileage.toLocaleString()} mi` : "N/A",
+        id: String(c.stockNumber),
+        location:
+          [c.storeName, c.stateAbbreviation].filter(Boolean).join(", ") +
+          (c.distance != null ? ` (${c.distance} mi away)` : ""),
+        url: `https://www.carmax.com/car/${c.stockNumber}`,
+      }))
+      .filter((v) => matchesFilters(v, a))
+      .slice(0, limit);
 
-        results.push({
-          title: titleEl?.textContent?.trim() ?? "Unknown Vehicle",
-          price: priceEl?.textContent?.trim() ?? "N/A",
-          mileage: mileageEl?.textContent?.trim() ?? "N/A",
-          id: stockNumber,
-          location: locationEl?.textContent?.trim() ?? "",
-          url: href || (stockNumber ? `https://www.carmax.com/car/${stockNumber}` : ""),
-        });
-      }
-      return results;
-    }, limit);
-
-    const totalText = await page
-      .evaluate(
-        () =>
-          document
-            .querySelector('[data-qa="results-count"], [class*="results-count"], [class*="ResultsCount"]')
-            ?.textContent?.trim() ?? ""
-      )
-      .catch(() => "");
-
-    return { searchUrl, vehicles, totalText };
+    return { searchUrl, vehicles, totalText: `${vehicles.length} of the ${cars.length} cars on the first results page match` };
   });
 }
 
@@ -576,26 +496,26 @@ async function handleCarmaxDetails(stockNumber: string) {
 
     const d = await scrapeDetails(
       page,
-      '[data-qa="vehicle-title"], [class*="vehicle-title"]',
-      '[data-qa="price"], [class*="asking-price"], [class*="vehicle-price"]',
-      '[data-qa="mileage"], [class*="mileage"], [class*="Mileage"]'
+      'h1',
+      '[data-testid="get-started-container"]',
+      'h1'
     );
     const location = await page
       .evaluate(
         () =>
           document
-            .querySelector('[data-qa="store-location"], [class*="store-name"], [class*="StoreInfo"]')
+            .querySelector('[data-testid="location-details-line2"]')
             ?.textContent?.trim() ?? ""
       )
       .catch(() => "");
-    const carfax = /carfax/i.test(d.body)
-      ? (d.body.match(/[^\n]*(accident|owner)[^\n]*/gi) ?? []).slice(0, 3).map((l) => `  • ${l.trim()}`)
-      : [];
+    const history = Array.from(new Set(d.body.match(/^.*\b(single owner|no accidents?|accident reported|AutoCheck|Carfax)\b.*$/gim) ?? []))
+      .slice(0, 4)
+      .map((l) => `  • ${l.trim()}`);
 
     return formatDetails(
       `CarMax Vehicle #${stockNumber}`,
       d,
-      [location ? `Location: ${location}` : "", carfax.length ? "\n**Carfax:**" : "", ...carfax],
+      [location ? `Location: ${location}` : "", history.length ? "\n**History:**" : "", ...history],
       `**View on CarMax:** ${url}`
     );
   });
@@ -672,8 +592,8 @@ async function handleCarmaxInstantOffer(a: Record<string, unknown>) {
 
   return withPage(async (page) => {
     await goto(page, "https://www.carmax.com/sell-my-car");
-    const offerText = await runSellFlow(page, a);
-    return formatOffer("CarMax", a, offerText, page.url() || "https://www.carmax.com/sell-my-car", [
+    const result = await runSellFlow(page, a);
+    return formatOffer("CarMax", a, result, page.url() || "https://www.carmax.com/sell-my-car", [
       "\n**Sell or Trade at CarMax:** https://www.carmax.com/sell-my-car",
       "Offers are valid for 7 days at any CarMax location.",
       "Questions? Call 1-800-CAR-MAX1 (1-800-227-6291)",
@@ -691,20 +611,37 @@ async function carvanaSearch(a: Record<string, unknown>): Promise<SearchResult> 
   return withPage(async (page) => {
     const limit = searchLimit(a);
     const path = a.make ? `/cars/${slug(a.make)}${a.model ? `-${slug(a.model)}` : ""}` : "/cars";
-    const params = new URLSearchParams();
-    if (a.zip) params.set("zip", String(a.zip));
-    const searchUrl = `https://www.carvana.com${path}${params.toString() ? `?${params}` : ""}`;
+    const searchUrl = `https://www.carvana.com${path}`;
 
     await goto(page, searchUrl);
-    await page
-      .waitForSelector('[data-qa="result-tile"], [data-testid="result-tile"], a[href*="/vehicle/"]', { timeout: 15000 })
-      .catch(() => null);
+    await page.waitForSelector('[data-testid="result-tile"]', { timeout: 15000 }).catch(() => null);
 
-    const cards = await scrapeCards(page, '[data-qa="result-tile"], [data-testid="result-tile"]', 'a[href*="/vehicle/"]', limit);
-    const vehicles = cards
-      .map(({ text, href }) => {
-        const id = href.match(/\/vehicle\/(\d+)/)?.[1] ?? "";
-        return { ...parseCardText(text), id, location: "", url: id ? `https://www.carvana.com/vehicle/${id}` : href };
+    const tiles = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('[data-testid="result-tile"]')).map((tile) => {
+        const text = (tid: string) => (tile.querySelector(`[data-testid="${tid}"]`) as HTMLElement | null)?.innerText ?? "";
+        return {
+          makeModel: text("make-model"),
+          trimMileage: text("trim-mileage"),
+          price: text("price"),
+          href: (tile.querySelector('a[href*="/vehicle/"]') as HTMLAnchorElement | null)?.href ?? "",
+        };
+      })
+    );
+
+    const vehicles = tiles
+      .map((t) => {
+        const id = t.href.match(/\/vehicle\/(\d+)/)?.[1] ?? "";
+        const lines = t.trimMileage.split("\n").map((l) => l.trim()).filter(Boolean);
+        const mileage = lines.find((l) => /miles?$/i.test(l)) ?? "";
+        const trim = lines.filter((l) => l !== mileage).join(" ");
+        return {
+          title: [t.makeModel.replace(/\s+/g, " ").trim(), trim].filter(Boolean).join(" "),
+          price: t.price.match(/\$[\d,]+/)?.[0] ?? "",
+          mileage,
+          id,
+          location: "",
+          url: id ? `https://www.carvana.com/vehicle/${id}` : t.href,
+        };
       })
       .filter((v) => v.id && matchesFilters(v, a))
       .slice(0, limit);
@@ -718,15 +655,35 @@ async function handleCarvanaDetails(vehicleId: string) {
   return withPage(async (page) => {
     const url = `https://www.carvana.com/vehicle/${vehicleId}`;
     await goto(page, url);
-    await page.waitForSelector("h1", { timeout: 15000 }).catch(() => null);
+    // The price card and spec section render after the title
+    await page
+      .waitForFunction(() => /\$[\d,]{4,}/.test(document.querySelector('[data-testid="vehicle-info-card"]')?.textContent ?? ""), null, {
+        timeout: 20000,
+      })
+      .catch(() => null);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(2000);
 
-    const d = await scrapeDetails(
-      page,
-      '[data-qa="vehicle-title"], [data-testid="vehicle-title"]',
-      '[data-qa="price"], [data-testid="price"], [class*="price"]',
-      '[data-qa="mileage"], [data-testid="mileage"], [class*="mileage"]'
+    const d = await scrapeDetails(page, "h1", '[data-testid="vehicle-info-card"]', '[data-testid="vehicle-info-card"]');
+
+    // "Vehicle Details" lists each label on one line and its value on the following line(s)
+    const labels = ["MPG", "Drivetrain", "Exterior color", "Interior", "Seating", "Engine", "Transmission", "Fuel type", "Number of keys", "Prior Use:"];
+    const section = d.body.slice(d.body.indexOf("Vehicle Details", 1000), d.body.indexOf("View All Features"));
+    const lines = section.split("\n").map((l) => l.trim()).filter(Boolean);
+    lines.forEach((line, i) => {
+      if (!labels.includes(line)) return;
+      const value: string[] = [];
+      for (let j = i + 1; j < lines.length && !labels.includes(lines[j]); j++) value.push(lines[j]);
+      if (value.length) d.specs[line.replace(/:$/, "")] = value.join(" ");
+    });
+    const total = d.body.match(/Total purchase price\s*\n\s*(\$[\d,]+)/)?.[1];
+
+    return formatDetails(
+      `Carvana Vehicle #${vehicleId}`,
+      d,
+      [total ? `Total with est. tax, title & registration: ${total}` : ""],
+      `**View on Carvana:** ${url}`
     );
-    return formatDetails(`Carvana Vehicle #${vehicleId}`, d, [], `**View on Carvana:** ${url}`);
   });
 }
 
@@ -735,141 +692,11 @@ async function handleCarvanaOffer(a: Record<string, unknown>) {
 
   return withPage(async (page) => {
     await goto(page, "https://www.carvana.com/sell-my-car");
-    const offerText = await runSellFlow(page, a);
-    return formatOffer("Carvana", a, offerText, page.url() || "https://www.carvana.com/sell-my-car", [
+    const result = await runSellFlow(page, a);
+    return formatOffer("Carvana", a, result, page.url() || "https://www.carvana.com/sell-my-car", [
       "\n**Sell or Trade at Carvana:** https://www.carvana.com/sell-my-car",
       "Carvana offers are typically valid for 7 days, with pickup or drop-off.",
     ]);
-  });
-}
-
-// ─── CarGurus ────────────────────────────────────────────────────────────────
-
-async function cargurusSearch(a: Record<string, unknown>): Promise<SearchResult> {
-  if (!a.zip || !a.make) throw new Error("CarGurus search requires zip and make");
-
-  return withPage(async (page) => {
-    const limit = searchLimit(a);
-    // CarGurus search URLs use internal make/model IDs, so drive the homepage search form instead
-    await goto(page, "https://www.cargurus.com/");
-    await page.waitForSelector("select", { timeout: 15000 }).catch(() => null);
-
-    const selectByLabel = async (label: string) => {
-      for (const select of await page.$$("select")) {
-        const options = await select.$$eval("option", (opts) => opts.map((o) => o.textContent?.trim() ?? ""));
-        const match = options.find((o) => o.toLowerCase() === label.toLowerCase());
-        if (match) {
-          await select.selectOption({ label: match });
-          await page.waitForTimeout(1000);
-          return true;
-        }
-      }
-      return false;
-    };
-
-    if (!(await selectByLabel(String(a.make)))) {
-      throw new Error(`Could not find make '${a.make}' in the CarGurus search form`);
-    }
-    if (a.model && !(await selectByLabel(String(a.model)))) {
-      throw new Error(`Could not find model '${a.model}' for ${a.make} in the CarGurus search form`);
-    }
-    await fillField(page, ['input[name="zip"]', 'input[id*="zip" i]', 'input[placeholder*="ZIP" i]'], String(a.zip));
-    await clickFirst(page, ['button[type="submit"]:has-text("Search")', 'button:has-text("Search")', 'input[type="submit"]']);
-
-    await page
-      .waitForSelector('[data-testid="srp-listing-tile"], [data-cg-ft="car-blade"], a[href*="listingId="], a[href*="#listing="]', {
-        timeout: 20000,
-      })
-      .catch(() => null);
-
-    const cards = await scrapeCards(
-      page,
-      '[data-testid="srp-listing-tile"], [data-cg-ft="car-blade"]',
-      'a[href*="listingId="], a[href*="#listing="], a[href*="/details/"]',
-      limit
-    );
-    const vehicles = cards
-      .map(({ text, href }) => {
-        const id = href.match(/(?:listingId=|#listing=|\/details\/)(\d+)/)?.[1] ?? "";
-        const location = text.match(/[A-Z][a-zA-Z .]+,\s*[A-Z]{2}\b/)?.[0] ?? "";
-        return { ...parseCardText(text), id, location, url: id ? cargurusListingUrl(id) : href };
-      })
-      .filter((v) => v.id && matchesFilters(v, a))
-      .slice(0, limit);
-
-    return { searchUrl: page.url(), vehicles };
-  });
-}
-
-function cargurusListingUrl(listingId: string) {
-  return `https://www.cargurus.com/Cars/inventorylisting/vdp.action?listingId=${listingId}`;
-}
-
-async function handleCargurusDetails(listingId: string) {
-  if (!listingId) return err("listing_id is required");
-  return withPage(async (page) => {
-    const url = cargurusListingUrl(listingId);
-    await goto(page, url);
-    await page.waitForSelector("h1", { timeout: 15000 }).catch(() => null);
-
-    const d = await scrapeDetails(
-      page,
-      '[data-cg-ft="vdp-listing-title"], [data-testid="vdp-title"]',
-      '[data-cg-ft="vdp-price"], [data-testid="vdp-price"], [class*="price"]',
-      '[data-cg-ft="vdp-mileage"], [class*="mileage"]'
-    );
-    const dealRating = d.body.match(/\b(Great|Good|Fair|High|Overpriced)\s+(Deal|Price)\b/i)?.[0];
-    const priceAnalysis = d.body.match(/\$[\d,]+\s+(below|above)\s+(?:CarGurus\s+)?(?:IMV|market|instant market value)[^\n]*/i)?.[0];
-    const daysOnMarket = d.body.match(/(\d+)\s+days?\s+(?:on|at)\s+(?:CarGurus|this dealership|market)/i)?.[0];
-    const dealer = await page
-      .evaluate(() => document.querySelector('[data-cg-ft="dealer-name"], [class*="dealerName"], [class*="DealerName"]')?.textContent?.trim() ?? "")
-      .catch(() => "");
-
-    return formatDetails(
-      `CarGurus Listing #${listingId}`,
-      d,
-      [
-        dealRating ? `Deal Rating: ${dealRating}` : "",
-        priceAnalysis ? `Price Analysis: ${priceAnalysis.trim()}` : "",
-        daysOnMarket ? `Days on Market: ${daysOnMarket}` : "",
-        dealer ? `Dealer: ${dealer}` : "",
-      ],
-      `**View on CarGurus:** ${url}`
-    );
-  });
-}
-
-async function handleCargurusContact(a: Record<string, unknown>) {
-  const listingId = a.listing_id as string;
-  if (!listingId) return err("listing_id is required");
-  if (!a.first_name || !a.last_name || !a.email) return err("first_name, last_name, and email are required");
-
-  return withPage(async (page) => {
-    const url = cargurusListingUrl(listingId);
-    await goto(page, url);
-    await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 15000 }).catch(() => null);
-
-    await fillContactForm(page, a);
-    await fillField(page, ['textarea[name="message"]', "textarea"], String(a.message ?? DEFAULT_DEALER_MESSAGE));
-
-    const submitted = await clickFirst(page, [
-      'button:has-text("Send message")',
-      'button:has-text("Check availability")',
-      'button:has-text("Send")',
-      'button[type="submit"]',
-    ]);
-    if (!submitted) {
-      return err(`Could not find the send button for CarGurus listing ${listingId}. No message was sent. Contact the dealer at ${url}`);
-    }
-
-    await page.waitForTimeout(4000);
-    const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
-    if (/(message|inquiry|request) (has been |was )?sent|thank you|we've sent|dealer will (contact|reach)/i.test(bodyText)) {
-      return ok(`**Message Sent to Dealer**\nCarGurus listing: ${listingId}\nName: ${a.first_name} ${a.last_name}\nPage: ${url}`);
-    }
-    return err(
-      `Message for CarGurus listing ${listingId} could not be verified — no confirmation was found on the page. It may or may NOT have been sent. Check your email or ${url}`
-    );
   });
 }
 
@@ -882,55 +709,68 @@ async function fillContactForm(page: Page, a: Record<string, unknown>) {
   if (a.phone) await fillField(page, ['input[name="phone"]', 'input[name*="phone" i]', 'input[type="tel"]'], String(a.phone));
 }
 
-// Fills the first step of a sell-my-car flow (VIN or plate, mileage, ZIP) and reads back any offer amount
-async function runSellFlow(page: Page, a: Record<string, unknown>) {
-  await page
-    .waitForSelector('input[placeholder*="VIN" i], input[placeholder*="plate" i], input[name*="vin" i], input[name*="plate" i]', {
-      timeout: 10000,
-    })
-    .catch(() => null);
+interface SellFlowResult {
+  offer: string;
+  // What the site showed when the flow stopped: the next questions, or an error such as an unknown VIN
+  step: string;
+}
 
+// Fills the first step of a sell-my-car flow (VIN or plate, ZIP), then reports the offer or the step it stopped at
+async function runSellFlow(page: Page, a: Record<string, unknown>): Promise<SellFlowResult> {
+  await page.waitForTimeout(2000);
   let inputFilled = false;
   if (a.vin) {
-    await clickFirst(page, ['button:has-text("VIN")', '[role="tab"]:has-text("VIN")']);
-    inputFilled = await fillField(page, ['input[name="vin"]', 'input[name*="vin" i]', 'input[placeholder*="VIN" i]'], String(a.vin));
+    await page.getByRole("button", { name: "VIN", exact: true }).first().click().catch(() => null);
+    await page.locator('[data-testid="Vin-tab"]').click({ timeout: 2000 }).catch(() => null);
+    await page.waitForTimeout(800);
+    inputFilled = await fillVisible(page, 'input[name="vin"], input#vin, input[name*="vin" i]', String(a.vin));
   } else if (a.license_plate) {
-    await clickFirst(page, ['button:has-text("License Plate")', '[role="tab"]:has-text("Plate")', 'a:has-text("License")']);
-    inputFilled = await fillField(
-      page,
-      ['input[name="licensePlate"]', 'input[name*="plate" i]', 'input[placeholder*="plate" i]'],
-      String(a.license_plate)
-    );
-    const stateSelect = await page.$('select[name="state"], select[name*="state" i]');
-    if (stateSelect && a.state) await stateSelect.selectOption(String(a.state).toUpperCase()).catch(() => null);
+    inputFilled = await fillVisible(page, 'input[name="licensePlate"], input#license_plate, input[name*="plate" i]', String(a.license_plate));
+    if (a.state) {
+      await page
+        .locator("select[name='state']:visible, select#state:visible")
+        .first()
+        .selectOption({ value: String(a.state).toUpperCase() })
+        .catch(() => null);
+    }
   }
-  if (!inputFilled) return "";
+  if (!inputFilled) return { offer: "", step: "Could not find the VIN / license plate field." };
 
-  if (a.mileage) await fillField(page, ['input[name="mileage"]', 'input[name*="mileage" i]', 'input[placeholder*="mileage" i]'], String(a.mileage));
-  if (a.zip) await fillField(page, ['input[name="zip"]', 'input[name*="zip" i]', 'input[placeholder*="ZIP" i]'], String(a.zip));
+  if (a.zip) await fillVisible(page, 'input[name="zipCode"], input[name*="zip" i]', String(a.zip));
 
-  const clicked = await clickFirst(page, [
-    'button:has-text("Get Offer")',
-    'button:has-text("Get My Offer")',
-    'button:has-text("Continue")',
-    'button[type="submit"]',
-  ]);
-  if (!clicked) return "";
+  const submit = page.getByRole("button", { name: /get (my |your )?offer/i }).first();
+  if (!(await submit.isVisible().catch(() => false))) return { offer: "", step: "Could not find the Get Offer button." };
+  await submit.click();
 
-  await page.waitForTimeout(4000);
-  await page
-    .waitForSelector('[data-qa*="offer"], [class*="offer-amount"], [class*="OfferAmount"], [class*="instant-offer"]', { timeout: 10000 })
-    .catch(() => null);
+  // Wait out the vehicle lookup ("Finding your car", "Finding your vehicle...")
+  await page.waitForTimeout(3000);
+  for (let i = 0; i < 30; i++) {
+    const text = await page.evaluate(() => document.body.innerText).catch(() => "");
+    if (!/finding your (car|vehicle)|gathering vehicle data|looking up/i.test(text)) break;
+    await page.waitForTimeout(1000);
+  }
+  await page.waitForTimeout(1500);
 
   return page.evaluate(() => {
+    const body = document.body.innerText;
     const offerEl = document.querySelector('[data-qa*="offer-amount"], [class*="offer-amount"], [class*="OfferAmount"]');
-    if (offerEl) return offerEl.textContent?.trim() ?? "";
     // Only trust a dollar amount that the page labels as an offer
-    return document.body.innerText.match(/offer[^$\n]{0,40}(\$[\d,]+(\s*[-–]\s*\$[\d,]+)?)/i)?.[1] ?? "";
+    const offer = offerEl?.textContent?.trim() || (body.match(/offer[^$\n]{0,40}(\$[\d,]+(\s*[-–]\s*\$[\d,]+)?)/i)?.[1] ?? "");
+    const error = body.match(/^.*(whoops|already own|couldn't find|could not find|not a valid|invalid|unable to).*$/im)?.[0];
+    const main = (document.querySelector("main") as HTMLElement | null)?.innerText ?? body;
+    const step = (error ?? main.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 15).join("\n")).trim();
+    return { offer, step };
   });
 }
 
-function formatOffer(site: string, a: Record<string, unknown>, offerText: string, currentUrl: string, footer: string[]) {
+async function fillVisible(page: Page, selector: string, value: string) {
+  const el = page.locator(selector).filter({ visible: true }).first();
+  if (!(await el.count())) return false;
+  await el.fill(value);
+  return true;
+}
+
+function formatOffer(site: string, a: Record<string, unknown>, result: SellFlowResult, currentUrl: string, footer: string[]) {
   const identifier = a.vin ? `VIN: ${a.vin}` : `License Plate: ${a.license_plate} (${a.state})`;
   const lines = [
     `**${site} Offer**\n`,
@@ -938,12 +778,13 @@ function formatOffer(site: string, a: Record<string, unknown>, offerText: string
     a.mileage ? `Mileage: ${Number(a.mileage).toLocaleString()} miles` : "",
     a.zip ? `ZIP: ${a.zip}` : "",
   ];
-  if (offerText) {
-    lines.push(`\n**Offer Amount: ${offerText}**`);
+  if (result.offer) {
+    lines.push(`\n**Offer Amount: ${result.offer}**`);
   } else {
     lines.push(
-      `\n${site} did not show an offer yet. It usually asks condition questions and an email before revealing it.`,
-      `  Continue here: ${currentUrl}`
+      `\n${site} has not shown an offer yet. It asks condition questions (and usually an email) before revealing it.`,
+      `\n**Where the flow stopped:**\n${result.step}`,
+      `\nContinue here: ${currentUrl}`
     );
   }
   lines.push(...footer);
