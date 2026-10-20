@@ -21,7 +21,8 @@ async function launchContext(): Promise<BrowserContext> {
     return browser.contexts()[0] ?? browser.newContext();
   }
   // A persistent profile keeps the sites' bot-check clearance cookies between runs
-  return chromium.launchPersistentContext(join(homedir(), ".cache", "mcp-car-shopping", "chrome-profile"), {
+  const profileDir = process.env.CHROME_PROFILE_DIR ?? join(homedir(), ".cache", "mcp-car-shopping", "chrome-profile");
+  return chromium.launchPersistentContext(profileDir, {
     channel: "chrome",
     // Headless Chrome trips the sites' bot protection, so run a real window parked off-screen
     headless: process.env.HEADLESS === "1",

@@ -31,6 +31,7 @@ By default the server drives your installed Google Chrome. It opens a real Chrom
 | Variable | Effect |
 |----------|--------|
 | `BROWSERBASE_CDP_URL` | Use a Browserbase remote browser instead of local Chrome, e.g. `wss://connect.browserbase.com?apiKey=YOUR_KEY`. Enable stealth mode / proxies; both sites block plain datacenter browsers. |
+| `CHROME_PROFILE_DIR` | Use a different Chrome profile directory (default `~/.cache/mcp-car-shopping/chrome-profile`). Give each concurrent server its own. |
 | `HEADLESS=1` | Run local Chrome headless. Usually gets blocked by CarMax and Carvana. |
 
 ## Usage with Claude Desktop
@@ -121,6 +122,10 @@ Both sites identify the car from the VIN or plate, then ask style and condition 
 npm install
 npm run typecheck
 npm run build   # bundles src/index.ts to dist/index.js
+
+# call tools from the command line
+node scripts/call.mjs --list
+node scripts/call.mjs carmax_search_inventory '{"make":"Audi","model":"A4","zip":"23452"}'
 ```
 
 ## How It Works
