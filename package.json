@@ -1,0 +1,52 @@
+{
+  "name": "@jtgregoire93/mcp-car-shopping",
+  "version": "0.1.0",
+  "description": "MCP server connector for CarMax, Carvana and CarGurus: search used cars across all three, get vehicle details, get sell offers, schedule test drives and contact dealers",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-car-shopping": "dist/index.js"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --outfile=dist/index.js --external:playwright-core --external:chromium-bidi",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "carmax",
+    "carvana",
+    "cargurus",
+    "cars",
+    "automotive",
+    "used-cars",
+    "ai-agent"
+  ],
+  "author": "jtgregoire93",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jtgregoire93/mcp-car-shopping.git"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "playwright-core": "^1.64.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
